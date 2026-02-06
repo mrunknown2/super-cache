@@ -1,4 +1,4 @@
-module github.com/saksit/supercache
+module github.com/mrunknown2/super-cache
 
 go 1.25.5
 
