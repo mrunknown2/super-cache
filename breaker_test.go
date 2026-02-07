@@ -10,7 +10,7 @@ import (
 
 func TestCircuitBreaker_StartsInClosedState(t *testing.T) {
 	cb := NewCircuitBreaker(3, time.Second)
-	assert.Equal(t, stateClosed, cb.State())
+	assert.Equal(t, CircuitClosed, cb.State())
 	assert.True(t, cb.Allow())
 }
 
@@ -18,15 +18,15 @@ func TestCircuitBreaker_OpensAfterThreshold(t *testing.T) {
 	cb := NewCircuitBreaker(3, time.Second)
 
 	cb.RecordFailure()
-	assert.Equal(t, stateClosed, cb.State())
+	assert.Equal(t, CircuitClosed, cb.State())
 	assert.True(t, cb.Allow())
 
 	cb.RecordFailure()
-	assert.Equal(t, stateClosed, cb.State())
+	assert.Equal(t, CircuitClosed, cb.State())
 	assert.True(t, cb.Allow())
 
 	cb.RecordFailure()
-	assert.Equal(t, stateOpen, cb.State())
+	assert.Equal(t, CircuitOpen, cb.State())
 	assert.False(t, cb.Allow())
 }
 
@@ -35,7 +35,7 @@ func TestCircuitBreaker_TransitionsToHalfOpenAfterCooldown(t *testing.T) {
 
 	cb.RecordFailure()
 	cb.RecordFailure()
-	assert.Equal(t, stateOpen, cb.State())
+	assert.Equal(t, CircuitOpen, cb.State())
 	assert.False(t, cb.Allow())
 
 	// Wait for cooldown
@@ -43,7 +43,7 @@ func TestCircuitBreaker_TransitionsToHalfOpenAfterCooldown(t *testing.T) {
 
 	// Should transition to Half-Open and allow one request
 	assert.True(t, cb.Allow())
-	assert.Equal(t, stateHalfOpen, cb.State())
+	assert.Equal(t, CircuitHalfOpen, cb.State())
 
 	// Second request should be denied in Half-Open
 	assert.False(t, cb.Allow())
@@ -59,7 +59,7 @@ func TestCircuitBreaker_HalfOpenToClosedOnSuccess(t *testing.T) {
 	cb.Allow() // transition to Half-Open
 
 	cb.RecordSuccess()
-	assert.Equal(t, stateClosed, cb.State())
+	assert.Equal(t, CircuitClosed, cb.State())
 	assert.True(t, cb.Allow())
 }
 
@@ -73,7 +73,7 @@ func TestCircuitBreaker_HalfOpenToOpenOnFailure(t *testing.T) {
 	cb.Allow() // transition to Half-Open
 
 	cb.RecordFailure()
-	assert.Equal(t, stateOpen, cb.State())
+	assert.Equal(t, CircuitOpen, cb.State())
 	assert.False(t, cb.Allow())
 }
 
@@ -84,15 +84,15 @@ func TestCircuitBreaker_SuccessResetsFailureCount(t *testing.T) {
 	cb.RecordFailure()
 	// Two failures, then a success resets
 	cb.RecordSuccess()
-	assert.Equal(t, stateClosed, cb.State())
+	assert.Equal(t, CircuitClosed, cb.State())
 
 	// Now need 3 more failures to open
 	cb.RecordFailure()
-	assert.Equal(t, stateClosed, cb.State())
+	assert.Equal(t, CircuitClosed, cb.State())
 	cb.RecordFailure()
-	assert.Equal(t, stateClosed, cb.State())
+	assert.Equal(t, CircuitClosed, cb.State())
 	cb.RecordFailure()
-	assert.Equal(t, stateOpen, cb.State())
+	assert.Equal(t, CircuitOpen, cb.State())
 }
 
 func TestCircuitBreaker_ConcurrentAccess(t *testing.T) {
@@ -113,5 +113,5 @@ func TestCircuitBreaker_ConcurrentAccess(t *testing.T) {
 
 	// Should not panic or race — just verify it completes
 	state := cb.State()
-	assert.Contains(t, []circuitState{stateClosed, stateOpen, stateHalfOpen}, state)
+	assert.Contains(t, []CircuitState{CircuitClosed, CircuitOpen, CircuitHalfOpen}, state)
 }

@@ -5,13 +5,31 @@ import (
 	"time"
 )
 
-type circuitState int32
+// CircuitState represents the state of the circuit breaker.
+type CircuitState int32
 
 const (
-	stateClosed   circuitState = 0
-	stateOpen     circuitState = 1
-	stateHalfOpen circuitState = 2
+	// CircuitClosed means the circuit is functioning normally.
+	CircuitClosed CircuitState = 0
+	// CircuitOpen means the circuit is tripped and rejecting requests.
+	CircuitOpen CircuitState = 1
+	// CircuitHalfOpen means the circuit is allowing a probe request.
+	CircuitHalfOpen CircuitState = 2
 )
+
+// String returns a human-readable name for the circuit state.
+func (s CircuitState) String() string {
+	switch s {
+	case CircuitClosed:
+		return "closed"
+	case CircuitOpen:
+		return "open"
+	case CircuitHalfOpen:
+		return "half-open"
+	default:
+		return "unknown"
+	}
+}
 
 // CircuitBreaker implements a lightweight circuit breaker pattern.
 // It transitions between Closed → Open → Half-Open states based on failure counts.
@@ -36,20 +54,20 @@ func NewCircuitBreaker(threshold int64, cooldown time.Duration) *CircuitBreaker 
 // Open → allow if cooldown expired (transition to Half-Open)
 // Half-Open → deny (one request already in flight)
 func (cb *CircuitBreaker) Allow() bool {
-	state := circuitState(cb.state.Load())
+	state := CircuitState(cb.state.Load())
 	switch state {
-	case stateClosed:
+	case CircuitClosed:
 		return true
-	case stateOpen:
+	case CircuitOpen:
 		lastFail := time.Unix(0, cb.lastFailure.Load())
 		if time.Since(lastFail) >= cb.cooldown {
 			// Try to transition to Half-Open (only one goroutine succeeds)
-			if cb.state.CompareAndSwap(int32(stateOpen), int32(stateHalfOpen)) {
+			if cb.state.CompareAndSwap(int32(CircuitOpen), int32(CircuitHalfOpen)) {
 				return true
 			}
 		}
 		return false
-	case stateHalfOpen:
+	case CircuitHalfOpen:
 		// Only one request is allowed in Half-Open; deny the rest
 		return false
 	default:
@@ -60,7 +78,7 @@ func (cb *CircuitBreaker) Allow() bool {
 // RecordSuccess records a successful operation and resets the breaker to Closed.
 func (cb *CircuitBreaker) RecordSuccess() {
 	cb.failures.Store(0)
-	cb.state.Store(int32(stateClosed))
+	cb.state.Store(int32(CircuitClosed))
 }
 
 // RecordFailure records a failed operation. If failures reach the threshold,
@@ -69,11 +87,11 @@ func (cb *CircuitBreaker) RecordFailure() {
 	cb.lastFailure.Store(time.Now().UnixNano())
 	failures := cb.failures.Add(1)
 	if failures >= cb.threshold {
-		cb.state.Store(int32(stateOpen))
+		cb.state.Store(int32(CircuitOpen))
 	}
 }
 
 // State returns the current circuit state.
-func (cb *CircuitBreaker) State() circuitState {
-	return circuitState(cb.state.Load())
+func (cb *CircuitBreaker) State() CircuitState {
+	return CircuitState(cb.state.Load())
 }

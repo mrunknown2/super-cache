@@ -15,7 +15,8 @@ Type-safe, generic Redis cache library for Go with dual-layer caching, circuit b
 - **Graceful Degradation** — Falls back to direct calls when Redis is down / degradation อัตโนมัติเมื่อ Redis มีปัญหา
 - **TTL Jitter** — Randomizes TTL to prevent cache avalanche / สุ่ม TTL เพื่อป้องกัน cache avalanche
 - **Observability Hooks** — OnHit, OnMiss, OnError, OnSet, OnDelete callbacks
-- **Batch Operations** — MGet/MSet with pipeline / รองรับ batch operation ผ่าน pipeline
+- **Batch Operations** — MGet/MSet/MDelete with pipeline / รองรับ batch operation ผ่าน pipeline
+- **Hook Panic Recovery** — Hooks that panic won't crash your application / Hook ที่ panic จะไม่ทำให้ app ล่ม
 - **Standalone & Cluster** — Supports both Redis modes / รองรับทั้ง standalone และ cluster
 
 ## Installation / การติดตั้ง
@@ -93,7 +94,10 @@ cache, err := supercache.New[T](redisClient, opts ...Option)
 | `Set(ctx, key, value)` | Set value with default TTL / เก็บค่าด้วย TTL เริ่มต้น |
 | `SetWithTTL(ctx, key, value, ttl)` | Set value with custom TTL / เก็บค่าด้วย TTL ที่กำหนดเอง |
 | `Delete(ctx, key)` | Delete a key / ลบ key |
+| `MDelete(ctx, keys)` | Delete multiple keys / ลบหลาย key พร้อมกัน |
 | `Exists(ctx, key)` | Check if key exists / ตรวจสอบว่า key มีอยู่หรือไม่ |
+| `GetTTL(ctx, key)` | Get remaining TTL / ดู TTL ที่เหลือของ key |
+| `CircuitBreakerState()` | Get circuit breaker state / ดูสถานะ circuit breaker |
 
 ### GetOrSet Pattern
 
@@ -135,6 +139,9 @@ _ = cache.MSet(ctx, map[string]string{
 // MGet — get multiple values
 results, _ := cache.MGet(ctx, []string{"a", "b", "c"})
 // results["a"] = "alpha", results["b"] = "bravo", "c" not present
+
+// MDelete — delete multiple keys
+_ = cache.MDelete(ctx, []string{"a", "b"})
 ```
 
 ### Clear / ล้าง Cache
@@ -162,6 +169,7 @@ Configure via functional options when calling `New[T]()`:
 | `WithHooks(h)` | NoopHooks | Observability hooks |
 | `WithFallbackOnError(true)` | `false` | Graceful degradation / degradation อัตโนมัติ |
 | `WithCircuitBreaker(cfg)` | disabled | Circuit breaker config |
+| `WithScanBatchSize(n)` | `100` | Keys per SCAN iteration in Clear/ClearPattern |
 
 ## Circuit Breaker
 
@@ -180,6 +188,14 @@ cache, _ := supercache.New[string](rc,
 ```
 
 **States / สถานะ:** Closed (normal) → Open (rejecting) → Half-Open (probing)
+
+Query the current state programmatically / ดูสถานะปัจจุบันได้ผ่านโค้ด:
+
+```go
+state := cache.CircuitBreakerState()
+// supercache.CircuitClosed, supercache.CircuitOpen, or supercache.CircuitHalfOpen
+fmt.Println(state) // "closed", "open", or "half-open"
+```
 
 ## Observability Hooks
 
@@ -253,11 +269,16 @@ Cache[T] interface
 go test ./...            # run all tests / รัน test ทั้งหมด
 go test -race ./...      # with race detector / ตรวจ race condition
 go test -cover ./...     # with coverage / ดู coverage
+go test -bench ./...     # run benchmarks / รัน benchmark
 ```
 
 Tests use [miniredis](https://github.com/alicebob/miniredis) (in-memory Redis) and [redismock](https://github.com/go-redis/redismock) — no real Redis instance required.
 
 ไม่ต้องมี Redis จริงในการรัน test
+
+Benchmarks are available for all core operations (Get, Set, GetOrSet, MGet, MSet, local cache hit).
+
+มี benchmark สำหรับทุก operation หลัก
 
 ## License
 

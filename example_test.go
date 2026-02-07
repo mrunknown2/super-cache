@@ -181,6 +181,89 @@ func ExampleCache_MGet() {
 	// c exists: false
 }
 
+func ExampleCache_MSet() {
+	c, mr := mustSetup()
+	defer mr.Close()
+	ctx := context.Background()
+
+	items := map[string]string{
+		"x": "x-ray",
+		"y": "yankee",
+	}
+	if err := c.MSet(ctx, items); err != nil {
+		panic(err)
+	}
+
+	val, err := c.Get(ctx, "x")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(val)
+	// Output: x-ray
+}
+
+func ExampleCache_Delete() {
+	c, mr := mustSetup()
+	defer mr.Close()
+	ctx := context.Background()
+
+	_ = c.Set(ctx, "temp", "value")
+	_ = c.Delete(ctx, "temp")
+
+	_, err := c.Get(ctx, "temp")
+	fmt.Println(errors.Is(err, supercache.ErrNotFound))
+	// Output: true
+}
+
+func ExampleCache_Exists() {
+	c, mr := mustSetup()
+	defer mr.Close()
+	ctx := context.Background()
+
+	_ = c.Set(ctx, "key1", "value1")
+
+	exists, err := c.Exists(ctx, "key1")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("key1 exists:", exists)
+
+	exists, err = c.Exists(ctx, "key2")
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("key2 exists:", exists)
+	// Output:
+	// key1 exists: true
+	// key2 exists: false
+}
+
+func ExampleWithFallbackOnError() {
+	mr, err := miniredis.Run()
+	if err != nil {
+		panic(err)
+	}
+	defer mr.Close()
+
+	rc, err := supercache.NewRedisClient(supercache.RedisConfig{
+		Mode:  supercache.RedisModeStandalone,
+		Addrs: []string{mr.Addr()},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = supercache.New[string](rc,
+		supercache.WithFallbackOnError(true),
+		supercache.WithoutLocalCache(),
+	)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("cache with fallback created")
+	// Output: cache with fallback created
+}
+
 func ExampleWithCircuitBreaker() {
 	mr, err := miniredis.Run()
 	if err != nil {

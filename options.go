@@ -1,6 +1,9 @@
 package supercache
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // CircuitBreakerConfig configures the circuit breaker.
 // When set (non-nil), the circuit breaker will trip after FailureThreshold
@@ -37,6 +40,9 @@ type Options struct {
 	FallbackOnError bool
 	// CircuitBreaker configures the circuit breaker. Nil means disabled.
 	CircuitBreaker *CircuitBreakerConfig
+	// ScanBatchSize is the number of keys to scan per SCAN iteration in Clear/ClearPattern.
+	// Default: 100.
+	ScanBatchSize int64
 }
 
 // DefaultOptions returns Options with sensible defaults.
@@ -50,22 +56,29 @@ func DefaultOptions() Options {
 		Hooks:          NoopHooks{},
 		LocalCacheSize: 1000,
 		LocalCacheTTL:  time.Minute,
+		ScanBatchSize:  100,
 	}
 }
 
 // Validate checks if the options are valid.
 func (o Options) Validate() error {
 	if o.DefaultTTL <= 0 {
-		return ErrInvalidConfig
+		return fmt.Errorf("%w: DefaultTTL must be positive", ErrInvalidConfig)
 	}
 	if o.NullTTL < 0 {
-		return ErrInvalidConfig
+		return fmt.Errorf("%w: NullTTL must not be negative", ErrInvalidConfig)
 	}
 	if o.JitterPercent < 0 || o.JitterPercent > 1 {
-		return ErrInvalidConfig
+		return fmt.Errorf("%w: JitterPercent must be between 0 and 1", ErrInvalidConfig)
 	}
 	if o.Serializer == nil {
-		return ErrInvalidConfig
+		return fmt.Errorf("%w: Serializer must not be nil", ErrInvalidConfig)
+	}
+	if o.LocalCacheSize > 0 && o.LocalCacheTTL <= 0 {
+		return fmt.Errorf("%w: LocalCacheTTL must be positive when LocalCacheSize > 0", ErrInvalidConfig)
+	}
+	if o.ScanBatchSize <= 0 {
+		return fmt.Errorf("%w: ScanBatchSize must be positive", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -137,6 +150,13 @@ func WithoutLocalCache() Option {
 func WithFallbackOnError(enabled bool) Option {
 	return func(o *Options) {
 		o.FallbackOnError = enabled
+	}
+}
+
+// WithScanBatchSize sets the number of keys to scan per SCAN iteration.
+func WithScanBatchSize(n int64) Option {
+	return func(o *Options) {
+		o.ScanBatchSize = n
 	}
 }
 

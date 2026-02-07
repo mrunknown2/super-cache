@@ -3,6 +3,7 @@ package supercache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1599,5 +1600,418 @@ func TestCache_CircuitBreaker_GetOrSetPtr(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, ErrCircuitOpen)
 
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- Hook panic recovery tests ---
+
+type panicHooks struct{}
+
+func (panicHooks) OnHit(ctx context.Context, key string)                    { panic("OnHit panic") }
+func (panicHooks) OnMiss(ctx context.Context, key string)                   { panic("OnMiss panic") }
+func (panicHooks) OnError(ctx context.Context, key string, err error)       { panic("OnError panic") }
+func (panicHooks) OnSet(ctx context.Context, key string, ttl time.Duration) { panic("OnSet panic") }
+func (panicHooks) OnDelete(ctx context.Context, key string)                 { panic("OnDelete panic") }
+
+func TestCache_HookPanicRecovery(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithHooks(panicHooks{}),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	user := testUser{ID: 1, Name: "John"}
+	entry := NewEntry(user)
+	data, _ := MsgPackSerializer{}.Marshal(entry)
+
+	t.Run("panic in OnSet does not crash", func(t *testing.T) {
+		mock.Regexp().ExpectSet("test:user:1", `.*`, 5*time.Minute).SetVal("OK")
+		err := c.Set(ctx, "user:1", user)
+		assert.NoError(t, err)
+	})
+
+	t.Run("panic in OnHit does not crash", func(t *testing.T) {
+		mock.ExpectGet("test:user:1").SetVal(string(data))
+		_, err := c.Get(ctx, "user:1")
+		assert.NoError(t, err)
+	})
+
+	t.Run("panic in OnMiss does not crash", func(t *testing.T) {
+		mock.ExpectGet("test:user:miss").RedisNil()
+		_, err := c.Get(ctx, "user:miss")
+		assert.ErrorIs(t, err, ErrNotFound)
+	})
+
+	t.Run("panic in OnError does not crash", func(t *testing.T) {
+		mock.ExpectGet("test:user:err").SetErr(errors.New("redis error"))
+		_, err := c.Get(ctx, "user:err")
+		assert.Error(t, err)
+	})
+
+	t.Run("panic in OnDelete does not crash", func(t *testing.T) {
+		mock.ExpectDel("test:user:1").SetVal(1)
+		err := c.Delete(ctx, "user:1")
+		assert.NoError(t, err)
+	})
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- MGet deserialization error with hook test ---
+
+func TestCache_MGet_DeserializationError_CallsOnError(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+	hooks := &trackingHooks{}
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithHooks(hooks),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	// Return invalid data that can't be deserialized
+	mock.ExpectMGet("test:user:1", "test:user:2").SetVal([]any{
+		"invalid-data-not-msgpack",
+		nil,
+	})
+
+	results, err := c.MGet(ctx, []string{"user:1", "user:2"})
+	require.NoError(t, err)
+	assert.Empty(t, results)
+	assert.Contains(t, hooks.errors, "user:1")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- Context cancellation tests ---
+
+func TestCache_Get_ContextCancelled(t *testing.T) {
+	c := setupMiniredisCache(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	_, err := c.Get(ctx, "user:1")
+	assert.Error(t, err)
+}
+
+func TestCache_Set_ContextCancelled(t *testing.T) {
+	c := setupMiniredisCache(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := c.Set(ctx, "user:1", testUser{ID: 1})
+	assert.Error(t, err)
+}
+
+func TestCache_GetOrSet_FnReturnsContextError(t *testing.T) {
+	cache, mock := setupTestCache(t)
+	ctx := context.Background()
+
+	mock.ExpectGet("test:user:timeout").RedisNil()
+
+	_, err := cache.GetOrSet(ctx, "user:timeout", func() (testUser, error) {
+		return testUser{}, context.DeadlineExceeded
+	})
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- GetOrSetWithTTL + CircuitBreaker combination ---
+
+func TestCache_GetOrSetWithTTL_CircuitBreaker(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithCircuitBreaker(CircuitBreakerConfig{
+			FailureThreshold: 2,
+			Cooldown:         time.Second,
+		}),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	// Trip breaker
+	for i := 0; i < 2; i++ {
+		mock.ExpectGet("test:user:fail").SetErr(errors.New("connection refused"))
+		_, _ = c.Get(ctx, "user:fail")
+	}
+
+	_, err = c.GetOrSetWithTTL(ctx, "user:cb", 10*time.Minute, func() (testUser, error) {
+		return testUser{ID: 1}, nil
+	})
+	assert.ErrorIs(t, err, ErrCircuitOpen)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- Concurrent MSet + MGet stress test ---
+
+func TestCache_Concurrent_MSet_MGet(t *testing.T) {
+	c := setupMiniredisCache(t)
+	ctx := context.Background()
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+
+	// Concurrent writes
+	for i := range goroutines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			items := map[string]testUser{
+				fmt.Sprintf("user:%d", idx): {ID: int64(idx), Name: fmt.Sprintf("User%d", idx)},
+			}
+			err := c.MSet(ctx, items)
+			assert.NoError(t, err)
+		}(i)
+	}
+	wg.Wait()
+
+	// Concurrent reads
+	for i := range goroutines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			keys := []string{fmt.Sprintf("user:%d", idx)}
+			results, err := c.MGet(ctx, keys)
+			assert.NoError(t, err)
+			assert.Len(t, results, 1)
+		}(i)
+	}
+	wg.Wait()
+}
+
+// --- CircuitBreakerState tests ---
+
+func TestCache_CircuitBreakerState(t *testing.T) {
+	t.Run("no circuit breaker returns CircuitClosed", func(t *testing.T) {
+		c := setupMiniredisCache(t)
+		assert.Equal(t, CircuitClosed, c.CircuitBreakerState())
+	})
+
+	t.Run("reports state after failures", func(t *testing.T) {
+		c, mock := setupTestCacheWithCircuitBreaker(t)
+		ctx := context.Background()
+
+		assert.Equal(t, CircuitClosed, c.CircuitBreakerState())
+
+		// Trip breaker
+		for i := 0; i < 3; i++ {
+			mock.ExpectGet("test:user:fail").SetErr(errors.New("connection refused"))
+			_, _ = c.Get(ctx, "user:fail")
+		}
+
+		assert.Equal(t, CircuitOpen, c.CircuitBreakerState())
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+// --- Redis cluster mode initialization test ---
+
+func TestNewRedisClient_ClusterMode(t *testing.T) {
+	cfg := RedisConfig{
+		Mode:  RedisModeCluster,
+		Addrs: []string{"localhost:7000", "localhost:7001"},
+	}
+	client, err := NewRedisClient(cfg)
+	require.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, RedisModeCluster, client.Mode())
+	_ = client.Close()
+}
+
+func TestNewRedisClient_StandaloneWithTLS(t *testing.T) {
+	cfg := RedisConfig{
+		Mode:   RedisModeStandalone,
+		Addrs:  []string{"localhost:6379"},
+		UseTLS: true,
+	}
+	client, err := NewRedisClient(cfg)
+	require.NoError(t, err)
+	assert.NotNil(t, client)
+	_ = client.Close()
+}
+
+// --- Options validation new tests ---
+
+func TestOptions_Validate_LocalCacheTTL(t *testing.T) {
+	o := DefaultOptions()
+	o.LocalCacheSize = 100
+	o.LocalCacheTTL = 0
+	err := o.Validate()
+	assert.ErrorIs(t, err, ErrInvalidConfig)
+}
+
+// --- CircuitBreaker String() test ---
+
+func TestCircuitState_String(t *testing.T) {
+	assert.Equal(t, "closed", CircuitClosed.String())
+	assert.Equal(t, "open", CircuitOpen.String())
+	assert.Equal(t, "half-open", CircuitHalfOpen.String())
+	assert.Equal(t, "unknown", CircuitState(99).String())
+}
+
+// --- MSet pipeline exec error test ---
+
+func TestCache_MSetWithTTL_PipelineExecError(t *testing.T) {
+	c := setupMiniredisCache(t)
+	ctx := context.Background()
+
+	// Normal MSet should work
+	items := map[string]testUser{
+		"user:1": {ID: 1, Name: "John"},
+		"user:2": {ID: 2, Name: "Jane"},
+	}
+	err := c.MSetWithTTL(ctx, items, 5*time.Minute)
+	require.NoError(t, err)
+
+	// Verify data was set
+	results, err := c.MGet(ctx, []string{"user:1", "user:2"})
+	require.NoError(t, err)
+	assert.Len(t, results, 2)
+}
+
+// --- GetOrSetPtr with CircuitBreaker + Fallback ---
+
+func TestCache_GetOrSetPtr_CircuitBreaker_WithFallback(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithFallbackOnError(true),
+		WithCircuitBreaker(CircuitBreakerConfig{
+			FailureThreshold: 2,
+			Cooldown:         time.Second,
+		}),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	// Trip breaker
+	for i := 0; i < 2; i++ {
+		mock.ExpectGet("test:user:fail").SetErr(errors.New("connection refused"))
+		_, _ = c.Get(ctx, "user:fail")
+	}
+
+	user := testUser{ID: 99, Name: "Fallback"}
+	result, err := c.GetOrSetPtr(ctx, "user:ptrfb", func() (*testUser, error) {
+		return &user, nil
+	})
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, user.ID, result.ID)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- MDelete tests ---
+
+func TestCache_MDelete(t *testing.T) {
+	cache, mock := setupTestCache(t)
+	ctx := context.Background()
+
+	t.Run("deletes multiple keys", func(t *testing.T) {
+		mock.ExpectDel("test:user:1", "test:user:2").SetVal(2)
+		err := cache.MDelete(ctx, []string{"user:1", "user:2"})
+		require.NoError(t, err)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("empty keys returns nil", func(t *testing.T) {
+		err := cache.MDelete(ctx, []string{})
+		require.NoError(t, err)
+	})
+
+	t.Run("redis error propagates", func(t *testing.T) {
+		mock.ExpectDel("test:user:err").SetErr(errors.New("connection refused"))
+		err := cache.MDelete(ctx, []string{"user:err"})
+		assert.Error(t, err)
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+}
+
+func TestCache_MDelete_CircuitBreaker(t *testing.T) {
+	c, mock := setupTestCacheWithCircuitBreaker(t)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		mock.ExpectGet("test:user:fail").SetErr(errors.New("connection refused"))
+		_, _ = c.Get(ctx, "user:fail")
+	}
+
+	err := c.MDelete(ctx, []string{"user:1"})
+	assert.ErrorIs(t, err, ErrCircuitOpen)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCache_MDelete_WithHooks(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+	hooks := &trackingHooks{}
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithHooks(hooks),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	mock.ExpectDel("test:user:1", "test:user:2").SetVal(2)
+	err = c.MDelete(ctx, []string{"user:1", "user:2"})
+	require.NoError(t, err)
+	assert.Contains(t, hooks.deletes, "user:1")
+	assert.Contains(t, hooks.deletes, "user:2")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- GetTTL tests ---
+
+func TestCache_GetTTL(t *testing.T) {
+	c := setupMiniredisCache(t)
+	ctx := context.Background()
+
+	t.Run("returns TTL for existing key", func(t *testing.T) {
+		err := c.SetWithTTL(ctx, "user:ttl", testUser{ID: 1}, 5*time.Minute)
+		require.NoError(t, err)
+
+		ttl, err := c.GetTTL(ctx, "user:ttl")
+		require.NoError(t, err)
+		assert.Greater(t, ttl, time.Duration(0))
+		assert.LessOrEqual(t, ttl, 5*time.Minute)
+	})
+
+	t.Run("returns ErrNotFound for missing key", func(t *testing.T) {
+		_, err := c.GetTTL(ctx, "user:missing")
+		assert.ErrorIs(t, err, ErrNotFound)
+	})
+}
+
+func TestCache_GetTTL_CircuitBreaker(t *testing.T) {
+	c, mock := setupTestCacheWithCircuitBreaker(t)
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		mock.ExpectGet("test:user:fail").SetErr(errors.New("connection refused"))
+		_, _ = c.Get(ctx, "user:fail")
+	}
+
+	_, err := c.GetTTL(ctx, "user:1")
+	assert.ErrorIs(t, err, ErrCircuitOpen)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }

@@ -3,6 +3,7 @@ package supercache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/go-redis/cache/v9"
@@ -39,8 +40,16 @@ type Cache[T any] interface {
 	MSetWithTTL(ctx context.Context, items map[string]T, ttl time.Duration) error
 	// Clear deletes all keys matching the prefix using SCAN.
 	Clear(ctx context.Context) error
+	// MDelete deletes multiple keys from cache.
+	MDelete(ctx context.Context, keys []string) error
+	// GetTTL returns the remaining TTL for a key.
+	// Returns 0, ErrNotFound if the key does not exist.
+	GetTTL(ctx context.Context, key string) (time.Duration, error)
 	// ClearPattern deletes all keys matching a pattern using SCAN.
 	ClearPattern(ctx context.Context, pattern string) error
+	// CircuitBreakerState returns the current circuit breaker state.
+	// Returns CircuitClosed if circuit breaker is not enabled.
+	CircuitBreakerState() CircuitState
 }
 
 // cacheImpl implements Cache[T] using go-redis/cache.
@@ -66,6 +75,7 @@ func New[T any](redisClient *RedisClient, opts ...Option) (Cache[T], error) {
 	if options.Hooks == nil {
 		options.Hooks = NoopHooks{}
 	}
+	options.Hooks = safeHooks{inner: options.Hooks}
 
 	cacheOpts := &cache.Options{
 		Redis: redisClient.Cmdable(),
@@ -459,6 +469,8 @@ func (c *cacheImpl[T]) MGet(ctx context.Context, keys []string) (map[string]T, e
 
 		var entry CacheEntry[T]
 		if err := c.opts.Serializer.Unmarshal([]byte(data), &entry); err != nil {
+			originalKey := keyMap[fullKeys[i]]
+			c.opts.Hooks.OnError(ctx, originalKey, fmt.Errorf("MGet unmarshal key %q: %w", originalKey, err))
 			continue
 		}
 
@@ -497,7 +509,14 @@ func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl 
 		return ErrCircuitOpen
 	}
 
-	pipe := c.redis.Cmdable().Pipeline()
+	type pipeItem struct {
+		fullKey string
+		data    []byte
+		ttl     time.Duration
+	}
+
+	// Serialize all items first to avoid partial pipeline on marshal error.
+	serialized := make([]pipeItem, 0, len(items))
 	for key, value := range items {
 		fullKey := c.fullKey(key)
 		actualTTL := ttlWithJitter(ttl, c.opts.JitterPercent)
@@ -505,10 +524,15 @@ func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl 
 		entry := NewEntry(value)
 		data, err := c.opts.Serializer.Marshal(entry)
 		if err != nil {
-			return err
+			return fmt.Errorf("MSet marshal key %q: %w", key, err)
 		}
 
-		pipe.Set(ctx, fullKey, data, actualTTL)
+		serialized = append(serialized, pipeItem{fullKey: fullKey, data: data, ttl: actualTTL})
+	}
+
+	pipe := c.redis.Cmdable().Pipeline()
+	for _, item := range serialized {
+		pipe.Set(ctx, item.fullKey, item.data, item.ttl)
 	}
 
 	_, err := pipe.Exec(ctx)
@@ -523,6 +547,68 @@ func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl 
 		c.breaker.RecordSuccess()
 	}
 	return nil
+}
+
+func (c *cacheImpl[T]) MDelete(ctx context.Context, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	if c.breaker != nil && !c.breaker.Allow() {
+		if c.opts.FallbackOnError {
+			return nil
+		}
+		return ErrCircuitOpen
+	}
+
+	fullKeys := make([]string, len(keys))
+	for i, key := range keys {
+		fullKeys[i] = c.fullKey(key)
+	}
+
+	err := c.redis.Cmdable().Del(ctx, fullKeys...).Err()
+	if err != nil {
+		if c.breaker != nil {
+			c.breaker.RecordFailure()
+		}
+		return err
+	}
+
+	if c.breaker != nil {
+		c.breaker.RecordSuccess()
+	}
+	for _, key := range keys {
+		c.opts.Hooks.OnDelete(ctx, key)
+	}
+	return nil
+}
+
+func (c *cacheImpl[T]) GetTTL(ctx context.Context, key string) (time.Duration, error) {
+	if c.breaker != nil && !c.breaker.Allow() {
+		if c.opts.FallbackOnError {
+			return 0, ErrNotFound
+		}
+		return 0, ErrCircuitOpen
+	}
+
+	fullKey := c.fullKey(key)
+	ttl, err := c.redis.Cmdable().TTL(ctx, fullKey).Result()
+	if err != nil {
+		if c.breaker != nil {
+			c.breaker.RecordFailure()
+		}
+		return 0, err
+	}
+
+	if c.breaker != nil {
+		c.breaker.RecordSuccess()
+	}
+
+	// Redis returns -2 when key doesn't exist, -1 when no TTL is set
+	if ttl < 0 {
+		return 0, ErrNotFound
+	}
+	return ttl, nil
 }
 
 func (c *cacheImpl[T]) Clear(ctx context.Context) error {
@@ -541,7 +627,7 @@ func (c *cacheImpl[T]) ClearPattern(ctx context.Context, pattern string) error {
 
 	var cursor uint64
 	for {
-		keys, nextCursor, err := c.redis.Scan(ctx, cursor, fullPattern, 100)
+		keys, nextCursor, err := c.redis.Scan(ctx, cursor, fullPattern, c.opts.ScanBatchSize)
 		if err != nil {
 			if c.breaker != nil {
 				c.breaker.RecordFailure()
@@ -568,4 +654,11 @@ func (c *cacheImpl[T]) ClearPattern(ctx context.Context, pattern string) error {
 		c.breaker.RecordSuccess()
 	}
 	return nil
+}
+
+func (c *cacheImpl[T]) CircuitBreakerState() CircuitState {
+	if c.breaker == nil {
+		return CircuitClosed
+	}
+	return c.breaker.State()
 }

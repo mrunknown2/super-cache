@@ -29,3 +29,33 @@ func (NoopHooks) OnSet(ctx context.Context, key string, ttl time.Duration) {}
 func (NoopHooks) OnDelete(ctx context.Context, key string)                 {}
 
 var _ Hooks = NoopHooks{}
+
+// safeHooks wraps a Hooks implementation to recover from panics.
+type safeHooks struct {
+	inner Hooks
+}
+
+func (s safeHooks) OnHit(ctx context.Context, key string) {
+	defer func() { recover() }()
+	s.inner.OnHit(ctx, key)
+}
+
+func (s safeHooks) OnMiss(ctx context.Context, key string) {
+	defer func() { recover() }()
+	s.inner.OnMiss(ctx, key)
+}
+
+func (s safeHooks) OnError(ctx context.Context, key string, err error) {
+	defer func() { recover() }()
+	s.inner.OnError(ctx, key, err)
+}
+
+func (s safeHooks) OnSet(ctx context.Context, key string, ttl time.Duration) {
+	defer func() { recover() }()
+	s.inner.OnSet(ctx, key, ttl)
+}
+
+func (s safeHooks) OnDelete(ctx context.Context, key string) {
+	defer func() { recover() }()
+	s.inner.OnDelete(ctx, key)
+}
