@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /Users/saksit/workspaces/super-cache log --oneline -5)",
+      "Bash(git -C /Users/saksit/workspaces/super-cache tag -l)",
+      "Bash(git -C /Users/saksit/workspaces/super-cache log --oneline -3)",
+      "Bash(git -C /Users/saksit/workspaces/super-cache status)",
+      "Bash(git -C /Users/saksit/workspaces/super-cache diff README.md)",
+      "Bash(git -C /Users/saksit/workspaces/super-cache add README.md)",
+      "Bash(git -C /Users/saksit/workspaces/super-cache commit -m \"$\\(cat <<''EOF''\nAdd comprehensive README in English and Thai\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git -C /Users/saksit/workspaces/super-cache push origin main --tags)",
+      "Bash(ls:*)",
+      "Bash(go vet:*)",
+      "Bash(wc:*)",
+      "Bash(sort:*)"
+    ]
+  }
+}

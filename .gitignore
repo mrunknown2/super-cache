@@ -11,6 +11,7 @@
 # Output of go coverage
 *.out
 *.coverprofile
+coverage.html
 
 # Go workspace
 go.work
