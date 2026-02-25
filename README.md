@@ -282,4 +282,4 @@ Benchmarks are available for all core operations (Get, Set, GetOrSet, MGet, MSet
 
 ## License
 
-MIT
+Apache-2.0 — see [LICENSE](LICENSE) for details.
