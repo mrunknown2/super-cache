@@ -1,6 +1,6 @@
 module github.com/mrunknown2/super-cache
 
-go 1.25.5
+go 1.26.0
 
 require (
 	github.com/alicebob/miniredis/v2 v2.36.1

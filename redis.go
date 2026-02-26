@@ -18,6 +18,12 @@ const (
 	RedisModeStandalone RedisMode = "standalone"
 	// RedisModeCluster is for Redis Cluster.
 	RedisModeCluster RedisMode = "cluster"
+	// RedisModeFailover is for Redis Sentinel (failover) mode.
+	RedisModeFailover RedisMode = "failover"
+	// RedisModeValkey is for Valkey standalone (wire-compatible with Redis).
+	RedisModeValkey RedisMode = "valkey"
+	// RedisModeValkeyCluster is for Valkey Cluster.
+	RedisModeValkeyCluster RedisMode = "valkey-cluster"
 )
 
 // RedisConfig holds Redis connection configuration.
@@ -30,6 +36,10 @@ type RedisConfig struct {
 	Addrs []string
 	// Password for Redis authentication.
 	Password string
+	// MasterName is the name of the Sentinel master (required for failover mode).
+	MasterName string
+	// SentinelPassword is the password for Sentinel authentication (optional).
+	SentinelPassword string
 	// DB selects the database (standalone mode only, ignored in cluster).
 	DB int
 	// UseTLS enables TLS connection.
@@ -91,7 +101,7 @@ func NewRedisClient(cfg RedisConfig) (*RedisClient, error) {
 	var sc scanner
 
 	switch cfg.Mode {
-	case RedisModeCluster:
+	case RedisModeCluster, RedisModeValkeyCluster:
 		client := redis.NewClusterClient(&redis.ClusterOptions{
 			Addrs:        cfg.Addrs,
 			Password:     cfg.Password,
@@ -106,7 +116,28 @@ func NewRedisClient(cfg RedisConfig) (*RedisClient, error) {
 		sc = client
 		closer = client.Close
 
-	case RedisModeStandalone:
+	case RedisModeFailover:
+		if cfg.MasterName == "" {
+			return nil, fmt.Errorf("%w: MasterName is required for failover mode", ErrInvalidConfig)
+		}
+		client := redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:       cfg.MasterName,
+			SentinelAddrs:    cfg.Addrs,
+			SentinelPassword: cfg.SentinelPassword,
+			Password:         cfg.Password,
+			DB:               cfg.DB,
+			PoolSize:         cfg.PoolSize,
+			MinIdleConns:     cfg.MinIdleConns,
+			DialTimeout:      cfg.DialTimeout,
+			ReadTimeout:      cfg.ReadTimeout,
+			WriteTimeout:     cfg.WriteTimeout,
+			TLSConfig:        tlsConfig,
+		})
+		cmdable = client
+		sc = client
+		closer = client.Close
+
+	case RedisModeStandalone, RedisModeValkey:
 		fallthrough
 	default:
 		client := redis.NewClient(&redis.Options{

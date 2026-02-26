@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/cache/v9"
@@ -47,9 +48,16 @@ type Cache[T any] interface {
 	GetTTL(ctx context.Context, key string) (time.Duration, error)
 	// ClearPattern deletes all keys matching a pattern using SCAN.
 	ClearPattern(ctx context.Context, pattern string) error
+	// Refresh updates the TTL of an existing key without changing its value.
+	// Returns ErrNotFound if the key does not exist.
+	Refresh(ctx context.Context, key string, ttl time.Duration) error
 	// CircuitBreakerState returns the current circuit breaker state.
 	// Returns CircuitClosed if circuit breaker is not enabled.
 	CircuitBreakerState() CircuitState
+	// Close shuts down the cache, releasing resources.
+	// After Close, all operations return ErrClosed.
+	// Close is idempotent — calling it multiple times is safe.
+	Close() error
 }
 
 // cacheImpl implements Cache[T] using go-redis/cache.
@@ -59,6 +67,7 @@ type cacheImpl[T any] struct {
 	opts    Options
 	breaker *CircuitBreaker
 	fullKey func(string) string
+	closed  atomic.Bool
 }
 
 // New creates a new Cache instance.
@@ -119,6 +128,9 @@ func New[T any](redisClient *RedisClient, opts ...Option) (Cache[T], error) {
 
 func (c *cacheImpl[T]) Get(ctx context.Context, key string) (T, error) {
 	var zero T
+	if c.closed.Load() {
+		return zero, ErrClosed
+	}
 	fullKey := c.fullKey(key)
 
 	if c.breaker != nil && !c.breaker.Allow() {
@@ -163,6 +175,9 @@ func (c *cacheImpl[T]) Set(ctx context.Context, key string, value T) error {
 }
 
 func (c *cacheImpl[T]) SetWithTTL(ctx context.Context, key string, value T, ttl time.Duration) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return nil
@@ -196,6 +211,9 @@ func (c *cacheImpl[T]) SetWithTTL(ctx context.Context, key string, value T, ttl 
 }
 
 func (c *cacheImpl[T]) SetNull(ctx context.Context, key string) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return nil
@@ -229,6 +247,9 @@ func (c *cacheImpl[T]) SetNull(ctx context.Context, key string) error {
 }
 
 func (c *cacheImpl[T]) Delete(ctx context.Context, key string) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return nil
@@ -254,6 +275,9 @@ func (c *cacheImpl[T]) Delete(ctx context.Context, key string) error {
 }
 
 func (c *cacheImpl[T]) Exists(ctx context.Context, key string) (bool, error) {
+	if c.closed.Load() {
+		return false, ErrClosed
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return false, nil
@@ -283,6 +307,9 @@ func (c *cacheImpl[T]) GetOrSet(ctx context.Context, key string, fn func() (T, e
 
 func (c *cacheImpl[T]) GetOrSetWithTTL(ctx context.Context, key string, ttl time.Duration, fn func() (T, error)) (T, error) {
 	var zero T
+	if c.closed.Load() {
+		return zero, ErrClosed
+	}
 
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
@@ -294,6 +321,10 @@ func (c *cacheImpl[T]) GetOrSetWithTTL(ctx context.Context, key string, ttl time
 	fullKey := c.fullKey(key)
 	actualTTL := ttlWithJitter(ttl, c.opts.JitterPercent)
 
+	var fnCalled bool
+	var fnResult T
+	var fnErr error
+
 	var entry CacheEntry[T]
 	err := c.codec.Once(&cache.Item{
 		Ctx:   ctx,
@@ -301,11 +332,12 @@ func (c *cacheImpl[T]) GetOrSetWithTTL(ctx context.Context, key string, ttl time
 		Value: &entry,
 		TTL:   actualTTL,
 		Do: func(item *cache.Item) (any, error) {
-			value, err := fn()
-			if err != nil {
-				return nil, err
+			fnResult, fnErr = fn()
+			fnCalled = true
+			if fnErr != nil {
+				return nil, fnErr
 			}
-			return NewEntry(value), nil
+			return NewEntry(fnResult), nil
 		},
 	})
 
@@ -315,9 +347,15 @@ func (c *cacheImpl[T]) GetOrSetWithTTL(ctx context.Context, key string, ttl time
 			c.breaker.RecordFailure()
 		}
 		if c.opts.FallbackOnError {
-			value, fnErr := fn()
-			if fnErr != nil {
-				return zero, fnErr
+			if fnCalled {
+				if fnErr != nil {
+					return zero, fnErr
+				}
+				return fnResult, nil
+			}
+			value, callErr := fn()
+			if callErr != nil {
+				return zero, callErr
 			}
 			return value, nil
 		}
@@ -340,6 +378,9 @@ func (c *cacheImpl[T]) GetOrSetPtr(ctx context.Context, key string, fn func() (*
 }
 
 func (c *cacheImpl[T]) GetOrSetPtrWithTTL(ctx context.Context, key string, ttl time.Duration, fn func() (*T, error)) (*T, error) {
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return fn()
@@ -350,6 +391,10 @@ func (c *cacheImpl[T]) GetOrSetPtrWithTTL(ctx context.Context, key string, ttl t
 	fullKey := c.fullKey(key)
 	actualTTL := ttlWithJitter(ttl, c.opts.JitterPercent)
 
+	var fnCalled bool
+	var fnResult *T
+	var fnErr error
+
 	var entry CacheEntry[T]
 	err := c.codec.Once(&cache.Item{
 		Ctx:   ctx,
@@ -357,15 +402,16 @@ func (c *cacheImpl[T]) GetOrSetPtrWithTTL(ctx context.Context, key string, ttl t
 		Value: &entry,
 		TTL:   actualTTL,
 		Do: func(item *cache.Item) (any, error) {
-			value, err := fn()
-			if err != nil {
-				return nil, err
+			fnResult, fnErr = fn()
+			fnCalled = true
+			if fnErr != nil {
+				return nil, fnErr
 			}
-			if value == nil {
+			if fnResult == nil {
 				item.TTL = ttlWithJitter(c.opts.NullTTL, c.opts.JitterPercent)
 				return NewNullEntry[T](), nil
 			}
-			return NewEntry(*value), nil
+			return NewEntry(*fnResult), nil
 		},
 	})
 
@@ -375,9 +421,15 @@ func (c *cacheImpl[T]) GetOrSetPtrWithTTL(ctx context.Context, key string, ttl t
 			c.breaker.RecordFailure()
 		}
 		if c.opts.FallbackOnError {
-			value, fnErr := fn()
-			if fnErr != nil {
-				return nil, fnErr
+			if fnCalled {
+				if fnErr != nil {
+					return nil, fnErr
+				}
+				return fnResult, nil
+			}
+			value, callErr := fn()
+			if callErr != nil {
+				return nil, callErr
 			}
 			return value, nil
 		}
@@ -397,6 +449,9 @@ func (c *cacheImpl[T]) GetOrSetPtrWithTTL(ctx context.Context, key string, ttl t
 }
 
 func (c *cacheImpl[T]) MGet(ctx context.Context, keys []string) (map[string]T, error) {
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
 	if len(keys) == 0 {
 		return make(map[string]T), nil
 	}
@@ -411,6 +466,7 @@ func (c *cacheImpl[T]) MGet(ctx context.Context, keys []string) (map[string]T, e
 			var entry CacheEntry[T]
 			err := c.codec.Get(ctx, fullKey, &entry)
 			if err == nil {
+				c.opts.Hooks.OnHit(ctx, key)
 				if !entry.IsNull {
 					output[key] = entry.Value
 				}
@@ -459,11 +515,13 @@ func (c *cacheImpl[T]) MGet(ctx context.Context, keys []string) (map[string]T, e
 
 	for i, result := range results {
 		if result == nil {
+			c.opts.Hooks.OnMiss(ctx, keyMap[fullKeys[i]])
 			continue
 		}
 
 		data, ok := result.(string)
 		if !ok {
+			c.opts.Hooks.OnMiss(ctx, keyMap[fullKeys[i]])
 			continue
 		}
 
@@ -474,8 +532,10 @@ func (c *cacheImpl[T]) MGet(ctx context.Context, keys []string) (map[string]T, e
 			continue
 		}
 
+		originalKey := keyMap[fullKeys[i]]
+		c.opts.Hooks.OnHit(ctx, originalKey)
+
 		if !entry.IsNull {
-			originalKey := keyMap[fullKeys[i]]
 			output[originalKey] = entry.Value
 
 			// Populate local cache from Redis results
@@ -498,6 +558,9 @@ func (c *cacheImpl[T]) MSet(ctx context.Context, items map[string]T) error {
 }
 
 func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl time.Duration) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
 	if len(items) == 0 {
 		return nil
 	}
@@ -510,9 +573,10 @@ func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl 
 	}
 
 	type pipeItem struct {
-		fullKey string
-		data    []byte
-		ttl     time.Duration
+		fullKey     string
+		originalKey string
+		data        []byte
+		ttl         time.Duration
 	}
 
 	// Serialize all items first to avoid partial pipeline on marshal error.
@@ -527,7 +591,7 @@ func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl 
 			return fmt.Errorf("MSet marshal key %q: %w", key, err)
 		}
 
-		serialized = append(serialized, pipeItem{fullKey: fullKey, data: data, ttl: actualTTL})
+		serialized = append(serialized, pipeItem{fullKey: fullKey, originalKey: key, data: data, ttl: actualTTL})
 	}
 
 	pipe := c.redis.Cmdable().Pipeline()
@@ -546,10 +610,16 @@ func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl 
 	if c.breaker != nil {
 		c.breaker.RecordSuccess()
 	}
+	for _, item := range serialized {
+		c.opts.Hooks.OnSet(ctx, item.originalKey, item.ttl)
+	}
 	return nil
 }
 
 func (c *cacheImpl[T]) MDelete(ctx context.Context, keys []string) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
 	if len(keys) == 0 {
 		return nil
 	}
@@ -584,6 +654,9 @@ func (c *cacheImpl[T]) MDelete(ctx context.Context, keys []string) error {
 }
 
 func (c *cacheImpl[T]) GetTTL(ctx context.Context, key string) (time.Duration, error) {
+	if c.closed.Load() {
+		return 0, ErrClosed
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return 0, ErrNotFound
@@ -616,6 +689,9 @@ func (c *cacheImpl[T]) Clear(ctx context.Context) error {
 }
 
 func (c *cacheImpl[T]) ClearPattern(ctx context.Context, pattern string) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return nil
@@ -656,9 +732,49 @@ func (c *cacheImpl[T]) ClearPattern(ctx context.Context, pattern string) error {
 	return nil
 }
 
+func (c *cacheImpl[T]) Refresh(ctx context.Context, key string, ttl time.Duration) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
+
+	if c.breaker != nil && !c.breaker.Allow() {
+		if c.opts.FallbackOnError {
+			return nil
+		}
+		return ErrCircuitOpen
+	}
+
+	fullKey := c.fullKey(key)
+	ok, err := c.redis.Cmdable().Expire(ctx, fullKey, ttl).Result()
+	if err != nil {
+		if c.breaker != nil {
+			c.breaker.RecordFailure()
+		}
+		return err
+	}
+
+	if c.breaker != nil {
+		c.breaker.RecordSuccess()
+	}
+
+	if !ok {
+		return ErrNotFound
+	}
+
+	c.opts.Hooks.OnSet(ctx, key, ttl)
+	return nil
+}
+
 func (c *cacheImpl[T]) CircuitBreakerState() CircuitState {
 	if c.breaker == nil {
 		return CircuitClosed
 	}
 	return c.breaker.State()
+}
+
+func (c *cacheImpl[T]) Close() error {
+	if c.closed.Swap(true) {
+		return nil // already closed
+	}
+	return c.redis.Close()
 }

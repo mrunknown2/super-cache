@@ -2015,3 +2015,375 @@ func TestCache_GetTTL_CircuitBreaker(t *testing.T) {
 	assert.ErrorIs(t, err, ErrCircuitOpen)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+// --- Close() tests ---
+
+func TestCache_Close(t *testing.T) {
+	c := setupMiniredisCache(t)
+	ctx := context.Background()
+
+	// Close the cache
+	err := c.Close()
+	require.NoError(t, err)
+
+	// All operations should return ErrClosed
+	_, err = c.Get(ctx, "key")
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.Set(ctx, "key", testUser{ID: 1})
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.SetWithTTL(ctx, "key", testUser{ID: 1}, time.Minute)
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.SetNull(ctx, "key")
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.Delete(ctx, "key")
+	assert.ErrorIs(t, err, ErrClosed)
+
+	_, err = c.Exists(ctx, "key")
+	assert.ErrorIs(t, err, ErrClosed)
+
+	_, err = c.GetOrSet(ctx, "key", func() (testUser, error) {
+		return testUser{}, nil
+	})
+	assert.ErrorIs(t, err, ErrClosed)
+
+	_, err = c.GetOrSetWithTTL(ctx, "key", time.Minute, func() (testUser, error) {
+		return testUser{}, nil
+	})
+	assert.ErrorIs(t, err, ErrClosed)
+
+	_, err = c.GetOrSetPtr(ctx, "key", func() (*testUser, error) {
+		return nil, nil
+	})
+	assert.ErrorIs(t, err, ErrClosed)
+
+	_, err = c.GetOrSetPtrWithTTL(ctx, "key", time.Minute, func() (*testUser, error) {
+		return nil, nil
+	})
+	assert.ErrorIs(t, err, ErrClosed)
+
+	_, err = c.MGet(ctx, []string{"key"})
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.MSet(ctx, map[string]testUser{"key": {ID: 1}})
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.MSetWithTTL(ctx, map[string]testUser{"key": {ID: 1}}, time.Minute)
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.MDelete(ctx, []string{"key"})
+	assert.ErrorIs(t, err, ErrClosed)
+
+	_, err = c.GetTTL(ctx, "key")
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.ClearPattern(ctx, "*")
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.Clear(ctx)
+	assert.ErrorIs(t, err, ErrClosed)
+
+	err = c.Refresh(ctx, "key", time.Minute)
+	assert.ErrorIs(t, err, ErrClosed)
+
+	// CircuitBreakerState should still work after close
+	state := c.CircuitBreakerState()
+	assert.Equal(t, CircuitClosed, state)
+}
+
+func TestCache_Close_Idempotent(t *testing.T) {
+	c := setupMiniredisCache(t)
+
+	err := c.Close()
+	require.NoError(t, err)
+
+	err = c.Close()
+	require.NoError(t, err)
+}
+
+func TestCache_Close_Concurrent(t *testing.T) {
+	c := setupMiniredisCache(t)
+	ctx := context.Background()
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+
+	for i := range goroutines {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if idx%2 == 0 {
+				_ = c.Close()
+			} else {
+				_, _ = c.Get(ctx, "key")
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// --- MSet OnSet hooks test ---
+
+func TestCache_MSet_CallsOnSetHooks(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+	hooks := &trackingHooks{}
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithHooks(hooks),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	mock.MatchExpectationsInOrder(false)
+	mock.Regexp().ExpectSet("test:user:1", `.*`, 5*time.Minute).SetVal("OK")
+	mock.Regexp().ExpectSet("test:user:2", `.*`, 5*time.Minute).SetVal("OK")
+
+	items := map[string]testUser{
+		"user:1": {ID: 1, Name: "John"},
+		"user:2": {ID: 2, Name: "Jane"},
+	}
+	err = c.MSet(ctx, items)
+	require.NoError(t, err)
+
+	assert.Len(t, hooks.sets, 2)
+	assert.Contains(t, hooks.sets, "user:1")
+	assert.Contains(t, hooks.sets, "user:2")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- MGet OnHit/OnMiss hooks tests ---
+
+func TestCache_MGet_CallsOnHitAndOnMiss(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+	hooks := &trackingHooks{}
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithHooks(hooks),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	user1 := testUser{ID: 1, Name: "John"}
+	entry1 := NewEntry(user1)
+	data1, _ := MsgPackSerializer{}.Marshal(entry1)
+
+	mock.ExpectMGet("test:user:1", "test:user:2").SetVal([]any{
+		string(data1),
+		nil, // miss
+	})
+
+	results, err := c.MGet(ctx, []string{"user:1", "user:2"})
+	require.NoError(t, err)
+	assert.Len(t, results, 1)
+
+	assert.Contains(t, hooks.hits, "user:1")
+	assert.Contains(t, hooks.misses, "user:2")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCache_MGet_LocalCache_CallsOnHit(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+	hooks := &trackingHooks{}
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithLocalCache(100, time.Minute),
+		WithHooks(hooks),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	user1 := testUser{ID: 1, Name: "John"}
+
+	// Set user1 via Set (goes into local cache + Redis)
+	mock.Regexp().ExpectSet("test:user:1", `.*`, 5*time.Minute).SetVal("OK")
+	err = c.Set(ctx, "user:1", user1)
+	require.NoError(t, err)
+	hooks.hits = nil // reset
+
+	// MGet should hit local cache
+	results, err := c.MGet(ctx, []string{"user:1"})
+	require.NoError(t, err)
+	assert.Len(t, results, 1)
+	assert.Contains(t, hooks.hits, "user:1")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- GetOrSetWithTTL fallback no double call ---
+
+func TestCache_GetOrSetWithTTL_FallbackDoesNotDoubleCall(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithFallbackOnError(true),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	user := testUser{ID: 1, Name: "John"}
+	var callCount atomic.Int64
+
+	// Redis GET misses, fn gets called in Once's Do, Redis SET fails -> triggers fallback
+	mock.ExpectGet("test:user:fb-double").RedisNil()
+	mock.Regexp().ExpectSet("test:user:fb-double", `.*`, 5*time.Minute).SetErr(errors.New("redis write error"))
+
+	result, err := c.GetOrSetWithTTL(ctx, "user:fb-double", 5*time.Minute, func() (testUser, error) {
+		callCount.Add(1)
+		return user, nil
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, user.ID, result.ID)
+	assert.Equal(t, int64(1), callCount.Load(), "fn() should only be called once")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestCache_GetOrSetPtrWithTTL_FallbackDoesNotDoubleCall(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithFallbackOnError(true),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	user := testUser{ID: 1, Name: "John"}
+	var callCount atomic.Int64
+
+	mock.ExpectGet("test:user:ptrfb-double").RedisNil()
+	mock.Regexp().ExpectSet("test:user:ptrfb-double", `.*`, 5*time.Minute).SetErr(errors.New("redis write error"))
+
+	result, err := c.GetOrSetPtrWithTTL(ctx, "user:ptrfb-double", 5*time.Minute, func() (*testUser, error) {
+		callCount.Add(1)
+		return &user, nil
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	assert.Equal(t, user.ID, result.ID)
+	assert.Equal(t, int64(1), callCount.Load(), "fn() should only be called once")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- Refresh tests ---
+
+func TestCache_Refresh(t *testing.T) {
+	c := setupMiniredisCache(t)
+	ctx := context.Background()
+
+	t.Run("refreshes TTL for existing key", func(t *testing.T) {
+		err := c.Set(ctx, "user:refresh", testUser{ID: 1})
+		require.NoError(t, err)
+
+		err = c.Refresh(ctx, "user:refresh", 10*time.Minute)
+		require.NoError(t, err)
+
+		ttl, err := c.GetTTL(ctx, "user:refresh")
+		require.NoError(t, err)
+		assert.Greater(t, ttl, 5*time.Minute)
+	})
+
+	t.Run("returns ErrNotFound for missing key", func(t *testing.T) {
+		err := c.Refresh(ctx, "user:missing", 10*time.Minute)
+		assert.ErrorIs(t, err, ErrNotFound)
+	})
+
+	t.Run("returns ErrClosed after close", func(t *testing.T) {
+		c2 := setupMiniredisCache(t)
+		_ = c2.Close()
+
+		err := c2.Refresh(ctx, "key", time.Minute)
+		assert.ErrorIs(t, err, ErrClosed)
+	})
+}
+
+func TestCache_Refresh_CallsOnSetHook(t *testing.T) {
+	db, mock := redismock.NewClientMock()
+	redisClient := NewRedisClientFromCmdable(db)
+	hooks := &trackingHooks{}
+
+	c, err := New[testUser](redisClient,
+		WithKeyPrefix("test:"),
+		WithJitterPercent(0),
+		WithoutLocalCache(),
+		WithHooks(hooks),
+	)
+	require.NoError(t, err)
+	ctx := context.Background()
+
+	mock.ExpectExpire("test:user:1", 10*time.Minute).SetVal(true)
+
+	err = c.Refresh(ctx, "user:1", 10*time.Minute)
+	require.NoError(t, err)
+	assert.Contains(t, hooks.sets, "user:1")
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// --- Redis Sentinel / Failover tests ---
+
+func TestNewRedisClient_FailoverMode(t *testing.T) {
+	client, err := NewRedisClient(RedisConfig{
+		Mode:       RedisModeFailover,
+		Addrs:      []string{"localhost:26379"},
+		MasterName: "mymaster",
+	})
+	require.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, RedisModeFailover, client.Mode())
+	_ = client.Close()
+}
+
+func TestNewRedisClient_FailoverMode_MissingMasterName(t *testing.T) {
+	_, err := NewRedisClient(RedisConfig{
+		Mode:  RedisModeFailover,
+		Addrs: []string{"localhost:26379"},
+	})
+	assert.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidConfig)
+}
+
+// --- Valkey tests ---
+
+func TestNewRedisClient_ValkeyMode(t *testing.T) {
+	client, err := NewRedisClient(RedisConfig{
+		Mode:  RedisModeValkey,
+		Addrs: []string{"localhost:6379"},
+	})
+	require.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, RedisModeValkey, client.Mode())
+	_ = client.Close()
+}
+
+func TestNewRedisClient_ValkeyClusterMode(t *testing.T) {
+	client, err := NewRedisClient(RedisConfig{
+		Mode:  RedisModeValkeyCluster,
+		Addrs: []string{"localhost:7000", "localhost:7001"},
+	})
+	require.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, RedisModeValkeyCluster, client.Mode())
+	_ = client.Close()
+}
