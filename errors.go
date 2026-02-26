@@ -23,4 +23,13 @@ var (
 
 	// ErrCircuitOpen indicates the circuit breaker is open and requests are being rejected.
 	ErrCircuitOpen = errors.New("supercache: circuit breaker is open")
+
+	// ErrKeyTooLong indicates the cache key exceeds MaxKeyLength.
+	ErrKeyTooLong = errors.New("supercache: key too long")
+
+	// ErrBatchTooLarge indicates the batch size exceeds MaxBatchSize.
+	ErrBatchTooLarge = errors.New("supercache: batch too large")
+
+	// ErrValueTooLarge indicates the value exceeds MaxValueSize.
+	ErrValueTooLarge = errors.New("supercache: value too large")
 )

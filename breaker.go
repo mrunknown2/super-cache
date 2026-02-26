@@ -1,7 +1,7 @@
 package supercache
 
 import (
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -33,10 +33,12 @@ func (s CircuitState) String() string {
 
 // CircuitBreaker implements a lightweight circuit breaker pattern.
 // It transitions between Closed → Open → Half-Open states based on failure counts.
+// All state transitions are protected by a mutex for collective atomicity.
 type CircuitBreaker struct {
-	state       atomic.Int32
-	failures    atomic.Int64
-	lastFailure atomic.Int64 // unix nano timestamp
+	mu          sync.Mutex
+	state       CircuitState
+	failures    int64
+	lastFailure time.Time
 	threshold   int64
 	cooldown    time.Duration
 }
@@ -54,17 +56,16 @@ func NewCircuitBreaker(threshold int64, cooldown time.Duration) *CircuitBreaker 
 // Open → allow if cooldown expired (transition to Half-Open)
 // Half-Open → deny (one request already in flight)
 func (cb *CircuitBreaker) Allow() bool {
-	state := CircuitState(cb.state.Load())
-	switch state {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	switch cb.state {
 	case CircuitClosed:
 		return true
 	case CircuitOpen:
-		lastFail := time.Unix(0, cb.lastFailure.Load())
-		if time.Since(lastFail) >= cb.cooldown {
-			// Try to transition to Half-Open (only one goroutine succeeds)
-			if cb.state.CompareAndSwap(int32(CircuitOpen), int32(CircuitHalfOpen)) {
-				return true
-			}
+		if time.Since(cb.lastFailure) >= cb.cooldown {
+			cb.state = CircuitHalfOpen
+			return true
 		}
 		return false
 	case CircuitHalfOpen:
@@ -77,21 +78,30 @@ func (cb *CircuitBreaker) Allow() bool {
 
 // RecordSuccess records a successful operation and resets the breaker to Closed.
 func (cb *CircuitBreaker) RecordSuccess() {
-	cb.failures.Store(0)
-	cb.state.Store(int32(CircuitClosed))
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.failures = 0
+	cb.state = CircuitClosed
 }
 
 // RecordFailure records a failed operation. If failures reach the threshold,
 // the breaker transitions to Open.
 func (cb *CircuitBreaker) RecordFailure() {
-	cb.lastFailure.Store(time.Now().UnixNano())
-	failures := cb.failures.Add(1)
-	if failures >= cb.threshold {
-		cb.state.Store(int32(CircuitOpen))
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	cb.lastFailure = time.Now()
+	cb.failures++
+	if cb.failures >= cb.threshold {
+		cb.state = CircuitOpen
 	}
 }
 
 // State returns the current circuit state.
 func (cb *CircuitBreaker) State() CircuitState {
-	return CircuitState(cb.state.Load())
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	return cb.state
 }

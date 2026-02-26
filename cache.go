@@ -126,10 +126,23 @@ func New[T any](redisClient *RedisClient, opts ...Option) (Cache[T], error) {
 	}, nil
 }
 
+func (c *cacheImpl[T]) validateKey(key string) error {
+	if key == "" {
+		return fmt.Errorf("%w: key must not be empty", ErrInvalidConfig)
+	}
+	if len(key) > c.opts.MaxKeyLength {
+		return fmt.Errorf("%w: key length %d exceeds max %d", ErrKeyTooLong, len(key), c.opts.MaxKeyLength)
+	}
+	return nil
+}
+
 func (c *cacheImpl[T]) Get(ctx context.Context, key string) (T, error) {
 	var zero T
 	if c.closed.Load() {
 		return zero, ErrClosed
+	}
+	if err := c.validateKey(key); err != nil {
+		return zero, err
 	}
 	fullKey := c.fullKey(key)
 
@@ -178,6 +191,9 @@ func (c *cacheImpl[T]) SetWithTTL(ctx context.Context, key string, value T, ttl 
 	if c.closed.Load() {
 		return ErrClosed
 	}
+	if err := c.validateKey(key); err != nil {
+		return err
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return nil
@@ -213,6 +229,9 @@ func (c *cacheImpl[T]) SetWithTTL(ctx context.Context, key string, value T, ttl 
 func (c *cacheImpl[T]) SetNull(ctx context.Context, key string) error {
 	if c.closed.Load() {
 		return ErrClosed
+	}
+	if err := c.validateKey(key); err != nil {
+		return err
 	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
@@ -250,6 +269,9 @@ func (c *cacheImpl[T]) Delete(ctx context.Context, key string) error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
+	if err := c.validateKey(key); err != nil {
+		return err
+	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
 			return nil
@@ -277,6 +299,9 @@ func (c *cacheImpl[T]) Delete(ctx context.Context, key string) error {
 func (c *cacheImpl[T]) Exists(ctx context.Context, key string) (bool, error) {
 	if c.closed.Load() {
 		return false, ErrClosed
+	}
+	if err := c.validateKey(key); err != nil {
+		return false, err
 	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
@@ -309,6 +334,9 @@ func (c *cacheImpl[T]) GetOrSetWithTTL(ctx context.Context, key string, ttl time
 	var zero T
 	if c.closed.Load() {
 		return zero, ErrClosed
+	}
+	if err := c.validateKey(key); err != nil {
+		return zero, err
 	}
 
 	if c.breaker != nil && !c.breaker.Allow() {
@@ -380,6 +408,9 @@ func (c *cacheImpl[T]) GetOrSetPtr(ctx context.Context, key string, fn func() (*
 func (c *cacheImpl[T]) GetOrSetPtrWithTTL(ctx context.Context, key string, ttl time.Duration, fn func() (*T, error)) (*T, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
+	}
+	if err := c.validateKey(key); err != nil {
+		return nil, err
 	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
@@ -455,6 +486,14 @@ func (c *cacheImpl[T]) MGet(ctx context.Context, keys []string) (map[string]T, e
 	if len(keys) == 0 {
 		return make(map[string]T), nil
 	}
+	if len(keys) > c.opts.MaxBatchSize {
+		return nil, fmt.Errorf("%w: %d keys exceeds max %d", ErrBatchTooLarge, len(keys), c.opts.MaxBatchSize)
+	}
+	for _, key := range keys {
+		if err := c.validateKey(key); err != nil {
+			return nil, err
+		}
+	}
 
 	output := make(map[string]T, len(keys))
 
@@ -525,6 +564,12 @@ func (c *cacheImpl[T]) MGet(ctx context.Context, keys []string) (map[string]T, e
 			continue
 		}
 
+		if len(data) > c.opts.MaxValueSize {
+			originalKey := keyMap[fullKeys[i]]
+			c.opts.Hooks.OnError(ctx, originalKey, fmt.Errorf("%w: key %q value size %d exceeds max %d", ErrValueTooLarge, originalKey, len(data), c.opts.MaxValueSize))
+			continue
+		}
+
 		var entry CacheEntry[T]
 		if err := c.opts.Serializer.Unmarshal([]byte(data), &entry); err != nil {
 			originalKey := keyMap[fullKeys[i]]
@@ -563,6 +608,14 @@ func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl 
 	}
 	if len(items) == 0 {
 		return nil
+	}
+	if len(items) > c.opts.MaxBatchSize {
+		return fmt.Errorf("%w: %d items exceeds max %d", ErrBatchTooLarge, len(items), c.opts.MaxBatchSize)
+	}
+	for key := range items {
+		if err := c.validateKey(key); err != nil {
+			return err
+		}
 	}
 
 	if c.breaker != nil && !c.breaker.Allow() {
@@ -623,6 +676,14 @@ func (c *cacheImpl[T]) MDelete(ctx context.Context, keys []string) error {
 	if len(keys) == 0 {
 		return nil
 	}
+	if len(keys) > c.opts.MaxBatchSize {
+		return fmt.Errorf("%w: %d keys exceeds max %d", ErrBatchTooLarge, len(keys), c.opts.MaxBatchSize)
+	}
+	for _, key := range keys {
+		if err := c.validateKey(key); err != nil {
+			return err
+		}
+	}
 
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
@@ -656,6 +717,9 @@ func (c *cacheImpl[T]) MDelete(ctx context.Context, keys []string) error {
 func (c *cacheImpl[T]) GetTTL(ctx context.Context, key string) (time.Duration, error) {
 	if c.closed.Load() {
 		return 0, ErrClosed
+	}
+	if err := c.validateKey(key); err != nil {
+		return 0, err
 	}
 	if c.breaker != nil && !c.breaker.Allow() {
 		if c.opts.FallbackOnError {
@@ -703,6 +767,9 @@ func (c *cacheImpl[T]) ClearPattern(ctx context.Context, pattern string) error {
 
 	var cursor uint64
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		keys, nextCursor, err := c.redis.Scan(ctx, cursor, fullPattern, c.opts.ScanBatchSize)
 		if err != nil {
 			if c.breaker != nil {
@@ -735,6 +802,9 @@ func (c *cacheImpl[T]) ClearPattern(ctx context.Context, pattern string) error {
 func (c *cacheImpl[T]) Refresh(ctx context.Context, key string, ttl time.Duration) error {
 	if c.closed.Load() {
 		return ErrClosed
+	}
+	if err := c.validateKey(key); err != nil {
+		return err
 	}
 
 	if c.breaker != nil && !c.breaker.Allow() {

@@ -44,6 +44,10 @@ type RedisConfig struct {
 	DB int
 	// UseTLS enables TLS connection.
 	UseTLS bool
+	// TLSConfig allows providing a custom *tls.Config.
+	// If set, UseTLS is implied and this config is used directly.
+	// If nil and UseTLS is true, a default TLS config with MinVersion TLS 1.2 is used.
+	TLSConfig *tls.Config
 	// PoolSize is the maximum number of connections.
 	PoolSize int
 	// MinIdleConns is the minimum number of idle connections.
@@ -89,7 +93,9 @@ func NewRedisClient(cfg RedisConfig) (*RedisClient, error) {
 	}
 
 	var tlsConfig *tls.Config
-	if cfg.UseTLS {
+	if cfg.TLSConfig != nil {
+		tlsConfig = cfg.TLSConfig
+	} else if cfg.UseTLS {
 		tlsConfig = &tls.Config{
 			MinVersion: tls.VersionTLS12,
 		}

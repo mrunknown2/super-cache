@@ -43,6 +43,15 @@ type Options struct {
 	// ScanBatchSize is the number of keys to scan per SCAN iteration in Clear/ClearPattern.
 	// Default: 100.
 	ScanBatchSize int64
+	// MaxKeyLength is the maximum allowed length for a cache key.
+	// Default: 1024.
+	MaxKeyLength int
+	// MaxBatchSize is the maximum number of items allowed in batch operations (MGet/MSet/MDelete).
+	// Default: 1000.
+	MaxBatchSize int
+	// MaxValueSize is the maximum allowed size in bytes for a serialized value during MGet unmarshal.
+	// Default: 1048576 (1MB).
+	MaxValueSize int
 }
 
 // DefaultOptions returns Options with sensible defaults.
@@ -57,6 +66,9 @@ func DefaultOptions() Options {
 		LocalCacheSize: 1000,
 		LocalCacheTTL:  time.Minute,
 		ScanBatchSize:  100,
+		MaxKeyLength:   1024,
+		MaxBatchSize:   1000,
+		MaxValueSize:   1048576, // 1MB
 	}
 }
 
@@ -79,6 +91,15 @@ func (o Options) Validate() error {
 	}
 	if o.ScanBatchSize <= 0 {
 		return fmt.Errorf("%w: ScanBatchSize must be positive", ErrInvalidConfig)
+	}
+	if o.MaxKeyLength <= 0 {
+		return fmt.Errorf("%w: MaxKeyLength must be positive", ErrInvalidConfig)
+	}
+	if o.MaxBatchSize <= 0 {
+		return fmt.Errorf("%w: MaxBatchSize must be positive", ErrInvalidConfig)
+	}
+	if o.MaxValueSize <= 0 {
+		return fmt.Errorf("%w: MaxValueSize must be positive", ErrInvalidConfig)
 	}
 	return nil
 }
@@ -157,6 +178,27 @@ func WithFallbackOnError(enabled bool) Option {
 func WithScanBatchSize(n int64) Option {
 	return func(o *Options) {
 		o.ScanBatchSize = n
+	}
+}
+
+// WithMaxKeyLength sets the maximum allowed cache key length.
+func WithMaxKeyLength(n int) Option {
+	return func(o *Options) {
+		o.MaxKeyLength = n
+	}
+}
+
+// WithMaxBatchSize sets the maximum batch size for MGet/MSet/MDelete.
+func WithMaxBatchSize(n int) Option {
+	return func(o *Options) {
+		o.MaxBatchSize = n
+	}
+}
+
+// WithMaxValueSize sets the maximum allowed serialized value size in bytes for MGet unmarshal.
+func WithMaxValueSize(n int) Option {
+	return func(o *Options) {
+		o.MaxValueSize = n
 	}
 }
 
