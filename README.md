@@ -16,8 +16,9 @@ Type-safe, generic Redis cache library for Go with dual-layer caching, circuit b
 - **TTL Jitter** — Randomizes TTL to prevent cache avalanche / สุ่ม TTL เพื่อป้องกัน cache avalanche
 - **Observability Hooks** — OnHit, OnMiss, OnError, OnSet, OnDelete callbacks
 - **Batch Operations** — MGet/MSet/MDelete with pipeline / รองรับ batch operation ผ่าน pipeline
-- **Hook Panic Recovery** — Hooks that panic won't crash your application / Hook ที่ panic จะไม่ทำให้ app ล่ม
-- **Standalone & Cluster** — Supports both Redis modes / รองรับทั้ง standalone และ cluster
+- **Hook Panic Recovery** — Hooks that panic are recovered and logged via `slog` / Hook ที่ panic จะถูก recover และ log ผ่าน `slog`
+- **Lifecycle Management** — `Close()` for graceful shutdown, `Refresh()` for TTL renewal / จัดการ lifecycle ด้วย `Close()` และ `Refresh()`
+- **Standalone, Cluster, Sentinel & Valkey** — Supports Redis standalone, cluster, Sentinel failover, and Valkey / รองรับ Redis standalone, cluster, Sentinel failover, และ Valkey
 
 ## Installation / การติดตั้ง
 
@@ -25,7 +26,7 @@ Type-safe, generic Redis cache library for Go with dual-layer caching, circuit b
 go get github.com/mrunknown2/super-cache@v0.1.0
 ```
 
-Requires Go 1.21+ (generics support).
+Requires Go 1.22+ (generics support).
 
 ## Quick Start / เริ่มต้นใช้งาน
 
@@ -64,6 +65,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer cache.Close() // always close when done / ปิดเมื่อใช้งานเสร็จ
 
 	ctx := context.Background()
 
@@ -93,10 +95,13 @@ cache, err := supercache.New[T](redisClient, opts ...Option)
 | `Get(ctx, key)` | Get value by key / ดึงค่าจาก key |
 | `Set(ctx, key, value)` | Set value with default TTL / เก็บค่าด้วย TTL เริ่มต้น |
 | `SetWithTTL(ctx, key, value, ttl)` | Set value with custom TTL / เก็บค่าด้วย TTL ที่กำหนดเอง |
+| `SetNull(ctx, key)` | Cache a null marker (penetration prevention) / cache ค่า null เพื่อป้องกัน penetration |
 | `Delete(ctx, key)` | Delete a key / ลบ key |
 | `MDelete(ctx, keys)` | Delete multiple keys / ลบหลาย key พร้อมกัน |
 | `Exists(ctx, key)` | Check if key exists / ตรวจสอบว่า key มีอยู่หรือไม่ |
 | `GetTTL(ctx, key)` | Get remaining TTL / ดู TTL ที่เหลือของ key |
+| `Refresh(ctx, key, ttl)` | Update TTL without changing value / อัปเดต TTL โดยไม่เปลี่ยนค่า |
+| `Close()` | Shut down cache, release resources / ปิด cache และคืน resource |
 | `CircuitBreakerState()` | Get circuit breaker state / ดูสถานะ circuit breaker |
 
 ### GetOrSet Pattern
@@ -142,6 +147,33 @@ results, _ := cache.MGet(ctx, []string{"a", "b", "c"})
 
 // MDelete — delete multiple keys
 _ = cache.MDelete(ctx, []string{"a", "b"})
+```
+
+### Refresh TTL
+
+Extend a key's TTL without fetching or modifying its value.
+
+ต่ออายุ TTL ของ key โดยไม่ต้องดึงหรือแก้ไขค่า
+
+```go
+err := cache.Refresh(ctx, "user:1", 10*time.Minute)
+if errors.Is(err, supercache.ErrNotFound) {
+    // key does not exist / key ไม่มีอยู่
+}
+```
+
+### Lifecycle / การจัดการ Lifecycle
+
+Always close the cache when your application shuts down to release Redis connections.
+
+ปิด cache เสมอเมื่อ application shutdown เพื่อคืน connection
+
+```go
+cache, _ := supercache.New[User](rc, ...)
+defer cache.Close()
+
+// After Close(), all operations return ErrClosed
+// หลังเรียก Close() ทุก operation จะ return ErrClosed
 ```
 
 ### Clear / ล้าง Cache
@@ -243,24 +275,59 @@ rc, _ := supercache.NewRedisClient(supercache.RedisConfig{
 })
 ```
 
+### Sentinel (Failover)
+
+```go
+rc, _ := supercache.NewRedisClient(supercache.RedisConfig{
+    Mode:             supercache.RedisModeFailover,
+    Addrs:            []string{"sentinel1:26379", "sentinel2:26379", "sentinel3:26379"},
+    MasterName:       "mymaster",
+    Password:         "secret",          // master password
+    SentinelPassword: "sentinel-secret", // optional sentinel password
+})
+```
+
+### Valkey
+
+[Valkey](https://valkey.io/) is wire-compatible with Redis. Use `RedisModeValkey` or `RedisModeValkeyCluster`.
+
+Valkey เข้ากันได้กับ Redis protocol ใช้ mode `RedisModeValkey` หรือ `RedisModeValkeyCluster`
+
+```go
+// Valkey standalone
+rc, _ := supercache.NewRedisClient(supercache.RedisConfig{
+    Mode:  supercache.RedisModeValkey,
+    Addrs: []string{"localhost:6379"},
+})
+
+// Valkey cluster
+rc, _ := supercache.NewRedisClient(supercache.RedisConfig{
+    Mode:  supercache.RedisModeValkeyCluster,
+    Addrs: []string{"node1:6379", "node2:6379"},
+})
+```
+
 ## Errors / ข้อผิดพลาด
 
 | Error | Description / คำอธิบาย |
 |-------|------------------------|
 | `ErrNotFound` | Key does not exist / ไม่พบ key |
 | `ErrNullValue` | Cached value is explicitly null / ค่าที่ cache เป็น null |
+| `ErrClosed` | Cache has been closed / cache ถูกปิดแล้ว |
 | `ErrCircuitOpen` | Circuit breaker is open / circuit breaker เปิดอยู่ |
 | `ErrInvalidConfig` | Invalid configuration / การตั้งค่าไม่ถูกต้อง |
 | `ErrConnection` | Redis connection failure / เชื่อมต่อ Redis ไม่ได้ |
+| `ErrSerialization` | Marshal/unmarshal failure / serialize/deserialize ล้มเหลว |
 
 ## Architecture / สถาปัตยกรรม
 
 ```
-Cache[T] interface
+Cache[T] interface  (+Close, +Refresh)
   └─ cacheImpl[T]
        ├─ go-redis/cache.Cache    — codec + local TinyLFU + singleflight
        ├─ CircuitBreaker          — Closed → Open → Half-Open
-       └─ RedisClient             — standalone / cluster
+       ├─ safeHooks               — panic recovery with slog logging
+       └─ RedisClient             — standalone / cluster / sentinel / valkey
 ```
 
 ## Testing / การทดสอบ
