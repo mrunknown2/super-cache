@@ -2387,3 +2387,108 @@ func TestNewRedisClient_ValkeyClusterMode(t *testing.T) {
 	assert.Equal(t, RedisModeValkeyCluster, client.Mode())
 	_ = client.Close()
 }
+
+// --- Local Cache Invalidation Integration Tests ---
+
+func TestCache_MDelete_InvalidatesLocalCache(t *testing.T) {
+	c := setupMiniredisCache(t, WithLocalCache(1000, time.Minute))
+	ctx := context.Background()
+
+	user1 := testUser{ID: 1, Name: "Alice"}
+	user2 := testUser{ID: 2, Name: "Bob"}
+
+	// Set values via single Set
+	require.NoError(t, c.Set(ctx, "user:1", user1))
+	require.NoError(t, c.Set(ctx, "user:2", user2))
+
+	// Get to populate local cache
+	val, err := c.Get(ctx, "user:1")
+	require.NoError(t, err)
+	assert.Equal(t, user1.ID, val.ID)
+
+	val, err = c.Get(ctx, "user:2")
+	require.NoError(t, err)
+	assert.Equal(t, user2.ID, val.ID)
+
+	// MDelete should invalidate both Redis and local cache
+	err = c.MDelete(ctx, []string{"user:1", "user:2"})
+	require.NoError(t, err)
+
+	// Get must return ErrNotFound (not stale local data)
+	_, err = c.Get(ctx, "user:1")
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	_, err = c.Get(ctx, "user:2")
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestCache_ClearPattern_InvalidatesLocalCache(t *testing.T) {
+	c := setupMiniredisCache(t, WithLocalCache(1000, time.Minute))
+	ctx := context.Background()
+
+	user1 := testUser{ID: 1, Name: "Alice"}
+	user2 := testUser{ID: 2, Name: "Bob"}
+
+	// Set values
+	require.NoError(t, c.Set(ctx, "user:1", user1))
+	require.NoError(t, c.Set(ctx, "user:2", user2))
+
+	// Get to populate local cache
+	val, err := c.Get(ctx, "user:1")
+	require.NoError(t, err)
+	assert.Equal(t, user1.ID, val.ID)
+
+	val, err = c.Get(ctx, "user:2")
+	require.NoError(t, err)
+	assert.Equal(t, user2.ID, val.ID)
+
+	// ClearPattern should invalidate matching keys in both Redis and local cache
+	err = c.ClearPattern(ctx, "user:*")
+	require.NoError(t, err)
+
+	// Get must return ErrNotFound (not stale local data)
+	_, err = c.Get(ctx, "user:1")
+	assert.ErrorIs(t, err, ErrNotFound)
+
+	_, err = c.Get(ctx, "user:2")
+	assert.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestCache_MSet_InvalidatesLocalCache(t *testing.T) {
+	c := setupMiniredisCache(t, WithLocalCache(1000, time.Minute))
+	ctx := context.Background()
+
+	user1 := testUser{ID: 1, Name: "Alice"}
+	user2 := testUser{ID: 2, Name: "Bob"}
+
+	// Set initial values
+	require.NoError(t, c.Set(ctx, "user:1", user1))
+	require.NoError(t, c.Set(ctx, "user:2", user2))
+
+	// Get to populate local cache with initial values
+	val, err := c.Get(ctx, "user:1")
+	require.NoError(t, err)
+	assert.Equal(t, "Alice", val.Name)
+
+	val, err = c.Get(ctx, "user:2")
+	require.NoError(t, err)
+	assert.Equal(t, "Bob", val.Name)
+
+	// MSet with NEW values
+	newUser1 := testUser{ID: 1, Name: "Alice Updated"}
+	newUser2 := testUser{ID: 2, Name: "Bob Updated"}
+	err = c.MSet(ctx, map[string]testUser{
+		"user:1": newUser1,
+		"user:2": newUser2,
+	})
+	require.NoError(t, err)
+
+	// Get must return the NEW values (not stale local cache)
+	val, err = c.Get(ctx, "user:1")
+	require.NoError(t, err)
+	assert.Equal(t, "Alice Updated", val.Name)
+
+	val, err = c.Get(ctx, "user:2")
+	require.NoError(t, err)
+	assert.Equal(t, "Bob Updated", val.Name)
+}
