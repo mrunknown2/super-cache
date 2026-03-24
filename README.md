@@ -15,7 +15,7 @@ Type-safe, generic Redis cache library for Go with dual-layer caching, circuit b
 - **Graceful Degradation** — Falls back to direct calls when Redis is down / degradation อัตโนมัติเมื่อ Redis มีปัญหา
 - **TTL Jitter** — Randomizes TTL to prevent cache avalanche / สุ่ม TTL เพื่อป้องกัน cache avalanche
 - **Observability Hooks** — OnHit, OnMiss, OnError, OnSet, OnDelete callbacks
-- **Batch Operations** — MGet/MSet/MDelete with pipeline / รองรับ batch operation ผ่าน pipeline
+- **Batch Operations** — MGet/MSet/MDelete with pipeline, full local cache sync / รองรับ batch operation ผ่าน pipeline พร้อม sync local cache
 - **Hook Panic Recovery** — Hooks that panic are recovered and logged via `slog` / Hook ที่ panic จะถูก recover และ log ผ่าน `slog`
 - **Lifecycle Management** — `Close()` for graceful shutdown, `Refresh()` for TTL renewal / จัดการ lifecycle ด้วย `Close()` และ `Refresh()`
 - **Standalone, Cluster, Sentinel & Valkey** — Supports Redis standalone, cluster, Sentinel failover, and Valkey / รองรับ Redis standalone, cluster, Sentinel failover, และ Valkey
