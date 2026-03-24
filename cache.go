@@ -660,6 +660,10 @@ func (c *cacheImpl[T]) MSetWithTTL(ctx context.Context, items map[string]T, ttl 
 		return err
 	}
 
+	for _, item := range serialized {
+		c.codec.DeleteFromLocalCache(item.fullKey)
+	}
+
 	if c.breaker != nil {
 		c.breaker.RecordSuccess()
 	}
@@ -703,6 +707,10 @@ func (c *cacheImpl[T]) MDelete(ctx context.Context, keys []string) error {
 			c.breaker.RecordFailure()
 		}
 		return err
+	}
+
+	for _, fullKey := range fullKeys {
+		c.codec.DeleteFromLocalCache(fullKey)
 	}
 
 	if c.breaker != nil {
@@ -784,6 +792,9 @@ func (c *cacheImpl[T]) ClearPattern(ctx context.Context, pattern string) error {
 					c.breaker.RecordFailure()
 				}
 				return err
+			}
+			for _, key := range keys {
+				c.codec.DeleteFromLocalCache(key)
 			}
 		}
 
